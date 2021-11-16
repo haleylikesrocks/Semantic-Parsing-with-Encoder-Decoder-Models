@@ -9,7 +9,7 @@ from lf_evaluator import *
 import numpy as np
 from typing import List
 
-def add_models_args(parser):
+def add_models_args(parser): #good hints on hyp[er parameters
     """
     Command-line arguments to the system related to your model.  Feel free to extend here.  
     """
@@ -65,6 +65,31 @@ class NearestNeighborSemanticParser(object):
 # for your network.
 ###################################################################################################################
 
+class RNNDecode(nn.Module):
+    def __init__(self, vocab_index, dict_size=27, input_size=50, hidden_size=30, class_size=27, num_layers=2): 
+        super(RNNDecode, self).__init__()    
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        self.rnn = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.hidden2tag = nn.Linear(hidden_size, class_size)
+        self.init_weight()
+
+    def init_weight(self):
+        nn.init.xavier_normal_(self.rnn.weight_hh_l0).type('torch.FloatTensor')
+        nn.init.xavier_normal_(self.rnn.weight_ih_l0).type('torch.FloatTensor')
+
+    def forward(self, input, batch=False):
+        if not batch:
+            input = input.unsqueeze(0)
+        batch_size = len(input) #if batch else 1
+        init_state = (torch.from_numpy(np.zeros((self.num_layers, batch_size, self.hidden_size))).type('torch.FloatTensor'),
+                      torch.from_numpy(np.zeros((self.num_layers, batch_size, self.hidden_size))).type('torch.FloatTensor'))
+        output, (hidden_state, cell_state) = self.rnn(input, init_state)
+        y = self.hidden2tag(output)
+        return y
+
 class Seq2SeqSemanticParser(nn.Module):
     def __init__(self, input_indexer, output_indexer, emb_dim, hidden_size, embedding_dropout=0.2, bidirect=True):
         # We've include some args for setting up the input embedding and encoder
@@ -75,9 +100,10 @@ class Seq2SeqSemanticParser(nn.Module):
         
         self.input_emb = EmbeddingLayer(emb_dim, len(input_indexer), embedding_dropout)
         self.encoder = RNNEncoder(emb_dim, hidden_size, bidirect)
-        raise Exception("implement me!")
+        self.decoder = RNNDecode(hidden_size)
+        self.loss_funct = torch.nn.CrossEntropyLoss(reduction='mean')
 
-    def forward(self, x_tensor, inp_lens_tensor, y_tensor, out_lens_tensor):
+    def forward(self, x_tensor, inp_lens_tensor, y_tensor, out_lens_tensor, batch=False):
         """
         :param x_tensor/y_tensor: either a non-batched input/output [sent len] vector of indices or a batched input/output
         [batch size x sent len]. y_tensor contains the gold sequence(s) used for training
@@ -85,10 +111,25 @@ class Seq2SeqSemanticParser(nn.Module):
         lengths aren't needed if you don't batchify the training.
         :return: loss of the batch
         """
-        raise Exception("implement me!")
+        # print(x_tensor)
+        # print(y_tensor)
+        # print(inp_lens_tensor)
+        # print(out_lens_tensor)
+
+        innner_state, cell, hidden = self.encode_input(x_tensor, inp_lens_tensor)
+        y = self.decode(hidden)
+        loss = self.loss_funct(y, y_tensor)
+        self.loss_funct.backward()
+        return loss
+
+    def interprocess(self, data):
+        return data
 
     def decode(self, test_data: List[Example]) -> List[List[Derivation]]:
-        raise Exception("implement me!")
+        decode_input = self.interprocess(test_data)
+        self.decoder.forward()
+
+        return 
 
     def encode_input(self, x_tensor, inp_lens_tensor):
         """
@@ -243,6 +284,28 @@ def make_padded_output_tensor(exs, output_indexer, max_len):
     return np.array([[ex.y_indexed[i] if i < len(ex.y_indexed) else output_indexer.index_of(PAD_SYMBOL) for i in range(0, max_len)] for ex in exs])
 
 
+def get_batches(data, batch_size):
+    count = 0
+    batches = []
+    count_down = len(data)
+    while count_down > batch_size:
+        batches.append(data[count:(count + batch_size)])
+        count += batch_size
+        count_down -= batch_size
+    if count_down > 1:
+        batches.append(data[count:])
+    
+    return batches
+
+def get_labels_and_data(batch):
+    labels = []
+    data = []
+    for datem, label in batch:
+        labels.append(label)
+        data.append(np.array(datem))
+    return torch.tensor(data), torch.tensor(labels)
+
+
 def train_model_encdec(train_data: List[Example], dev_data: List[Example], input_indexer, output_indexer, args) -> Seq2SeqSemanticParser:
     """
     Function to train the encoder-decoder model on the given data.
@@ -259,7 +322,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     all_test_input_data = make_padded_input_tensor(dev_data, input_indexer, input_max_len, reverse_input=False)
 
     output_max_len = np.max(np.asarray([len(ex.y_indexed) for ex in train_data]))
-    all_train_output_data = make_padded_output_tensor(train_data, output_indexer, output_max_len)
+    all_train_output_data = make_padded_output_tensor(train_data, output_indexer, output_max_len) # gold label
     all_test_output_data = make_padded_output_tensor(dev_data, output_indexer, output_max_len)
 
     if args.print_dataset:
@@ -267,6 +330,35 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
         print("Train output length: %i" % np.max(np.asarray([len(ex.y_indexed) for ex in train_data])))
         print("Train matrix: %s; shape = %s" % (all_train_input_data, all_train_input_data.shape))
 
+    paired_train_data = list(zip(all_train_input_data, all_train_output_data))
+
+    epochs = 2
+    initial_learning_rate = 1e-3
+    batch_size = 32
+    input_len = []
+    output_len = []
+    for i in range(batch_size):
+        input_len.append(input_max_len)
+        output_len.append(output_max_len)
+
+    model = Seq2SeqSemanticParser(input_indexer, output_indexer, 100, 100)
+    optimizer = torch.optim.Adam(model.parameters(), lr=initial_learning_rate)
+
     # First create a model. Then loop over epochs, loop over examples, and given some indexed words
     # call your seq-to-seq model, accumulate losses, update parameters
-    raise Exception("Implement the rest of me to train your encoder-decoder model")
+    for epoch in range(epochs):
+        total_loss = 0.0
+        random.shuffle(paired_train_data)
+        batches = get_batches(paired_train_data, batch_size)
+
+        for batch in batches:
+            batch_data, batch_label = get_labels_and_data(batch)
+            # print("the input dim ar currently", batch_data.shape)
+            model.zero_grad()
+            loss = model.forward(batch_data, torch.tensor(input_len), batch_label, torch.tensor(output_len), batch=True)
+            total_loss += loss
+            optimizer.step()
+
+        print("Total loss on epoch %i: %f" % (epoch, total_loss))
+
+    return model
